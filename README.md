@@ -18,7 +18,7 @@ A small collection of utility scripts and extensions for Unity Sentis
         URL: https://package.openupm.com
         Scope(s): com.doji
  
-  4. In the Package Manager install `com.doji.sentis-utils` either by name or select it in the list under `Package Manager -> My Registries`
+  4. In the Package Manager install `tools.doji.sentis-utils` either by name or select it in the list under `Package Manager -> My Registries`
   5. For the time being,  you also have to use a custom fork of Sentis: In the package Manager -> `Package Manager -> Install package from git URL-> https://github.com/julienkay/com.unity.sentis.git`
 
 </details>
@@ -41,9 +41,9 @@ Some not-so-great aspects:
 - need to use Reflection to access the internal TensorShape.Split() method to get the shape when splitting tensors
 
 **Used by**
-- [com.doji.transformers]
-- [com.doji.diffusers]
+- [tools.doji.transformers]
+- [tools.doji.diffusers]
 
-[OpenUPM]: https://openupm.com/packages/com.doji.sentis-utils
-[com.doji.transformers]: https://github.com/julienkay/com.doji.diffusers
-[com.doji.diffusers]: https://github.com/julienkay/com.doji.diffusers
+[OpenUPM]: https://openupm.com/packages/tools.doji.sentis-utils
+[tools.doji.transformers]: https://github.com/julienkay/tools.doji.diffusers
+[tools.doji.diffusers]: https://github.com/julienkay/tools.doji.diffusers

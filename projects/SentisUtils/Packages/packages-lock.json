@@ -1,7 +1,7 @@
 {
   "dependencies": {
-    "com.doji.sentis-utils": {
-      "version": "file:../../../com.doji.sentis-utils",
+    "tools.doji.sentis-utils": {
+      "version": "file:../../../tools.doji.sentis-utils",
       "depth": 0,
       "source": "local",
       "dependencies": {

@@ -1,5 +1,5 @@
 {
-  "name": "com.doji.sentis-utils",
+  "name": "tools.doji.sentis-utils",
   "version": "0.1.1",
   "displayName": "Sentis Utils",
   "description": "A small collection of utility scripts and extensions for Unity Sentis",
