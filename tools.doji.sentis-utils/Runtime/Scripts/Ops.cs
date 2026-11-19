@@ -33,6 +33,7 @@ namespace Doji.AI {
             if (tensor == null) {
                 throw new ArgumentNullException(nameof(tensor), "The tensor to take ownership of was null");
             }
+            ThrowIfDisposed(tensor);
             if (!_pool.Contains(tensor)) {
                 UnityEngine.Debug.LogWarning($"Unable to find Tensor {tensor} in the temporary pool of Ops tensors. Check if it hasn't already been disposed.");
                 return null;
@@ -44,6 +45,7 @@ namespace Doji.AI {
             if (tensor == null) {
                 throw new ArgumentNullException(nameof(tensor), "The tensor to wave ownership of was null");
             }
+            ThrowIfDisposed(tensor);
             if (_pool.Contains(tensor)) {
                 UnityEngine.Debug.LogWarning($"The Tensor {tensor} was already present in the temporary pool of Ops tensors.");
                 return false;
@@ -51,11 +53,29 @@ namespace Doji.AI {
             return _pool.Add(tensor);
         }
 
+        /// <summary>
+        /// Disposes all tensors that this <see cref="Ops"/> instance owns.
+        /// </summary>
         public void FlushTensors() {
             foreach (Tensor t in _pool) {
                 t.Dispose();
             }
             _pool.Clear();
+        }
+
+        /// <summary>
+        /// Throws an <see cref="ObjectDisposedException"/> if <paramref name="tensor"/> was disposed.
+        /// </summary>
+        /// <remarks>
+        /// A disposed tensor has no data, and a worker that reads it gives wrong values
+        /// with no exception. Call this on tensors before you pass them to a worker, for example
+        /// when an Ops result was disposed with `using` but is still in use.
+        /// </remarks>
+        public static void ThrowIfDisposed(Tensor tensor) {
+            if (tensor != null && tensor.disposed) {
+                throw new ObjectDisposedException($"{tensor.dataType} tensor {tensor.shape}",
+                    "The tensor was disposed. If an Ops method returned it, Ops disposes it on the next flush.");
+            }
         }
 
         private bool AddToPool(Tensor tensor) {
@@ -781,6 +801,42 @@ namespace Doji.AI {
             var copy = AllocNoData<float>(tensor.shape);
             _backend.MemCopy(tensor, copy);
             return copy;
+        }
+
+        /// <summary>
+        /// Returns the indices of the elements of <paramref name="X"/> that are not zero,
+        /// like ONNX NonZero: the output has shape (rank, count), one row per dimension.
+        /// </summary>
+        /// <remarks>
+        /// The output shape depends on the data, so this reads <paramref name="X"/> back
+        /// to the CPU and waits for the backend.
+        /// </remarks>
+        public Tensor<int> NonZero(Tensor<float> X) {
+            ThrowIfDisposed(X);
+            float[] data = X.DownloadToArray();
+            int rank = X.shape.rank;
+
+            int count = 0;
+            foreach (float value in data) {
+                if (value != 0f) {
+                    count++;
+                }
+            }
+
+            int[] indices = new int[rank * count];
+            int n = 0;
+            for (int flat = 0; flat < data.Length; flat++) {
+                if (data[flat] == 0f) {
+                    continue;
+                }
+                int remainder = flat;
+                for (int axis = rank - 1; axis >= 0; axis--) {
+                    indices[axis * count + n] = remainder % X.shape[axis];
+                    remainder /= X.shape[axis];
+                }
+                n++;
+            }
+            return NewTensor(new TensorShape(rank, count), indices);
         }
     }
 }
