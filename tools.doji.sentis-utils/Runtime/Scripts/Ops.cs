@@ -15,7 +15,6 @@ namespace Doji.AI {
         public Ops(BackendType backendType) {
             BackendType = backendType;
             _backend = BackendFactory.CreateBackend(backendType);
-            UnityEngine.Debug.Log("Backend type: " + _backend.ToString());
         }
 
         public void Dispose() {
