@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 - `Ops.NonZero`, which returns the indices of the non-zero elements like ONNX NonZero, with shape (rank, count).
 - `Ops.ThrowIfDisposed`, to check a tensor before a worker reads it. A worker that reads a disposed tensor gives wrong values with no exception.
+- `WorkerUtils.CreateWorkerWithWeightsOnGpu`, which uploads a model's weights to the GPU in chunks and frees their CPU copy, so the weights are not in RAM and on the GPU at the same time.
 
 ### Changed
 
