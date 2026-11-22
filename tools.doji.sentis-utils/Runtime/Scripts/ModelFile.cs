@@ -91,6 +91,12 @@ namespace Doji.AI {
         public Model LoadModel() => ModelLoader.Load(Path);
 
         /// <summary>
+        /// Slices the attention of the workers created after this, as <see cref="Attention.Slice"/> does.
+        /// </summary>
+        /// <returns>The number of sliced attentions.</returns>
+        public int SliceAttention(long maxScoreBytes = Attention.DefaultSliceBytes) => Attention.Slice(_model, maxScoreBytes);
+
+        /// <summary>
         /// Whether a copy of the weights stays in native memory, so <see cref="CreateWorker"/> uploads them from
         /// RAM instead of reading the file. Setting it reads or frees the copy.
         /// </summary>
