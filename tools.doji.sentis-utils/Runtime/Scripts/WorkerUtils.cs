@@ -33,12 +33,19 @@ namespace Doji.AI {
                 return new Worker(model, backendType);
             }
 
+            var readOnCpu = CPUFallbackCalculator.Calculate(model, backendType, out _);
+            foreach (var constant in model.constants) {
+                if (StaysOnCpu(constant, readOnCpu) && constant.array.Array != null) {
+                    // A loaded .sentis model keeps its weights in large shared arrays. A copy lets those be freed.
+                    constant.array = new ArraySegment<byte>(constant.array.ToArray());
+                }
+            }
+
             var storage = new ModelStorage();
             var worker = new Worker(model, BackendFactory.CreateBackend(backendType), storage);
-            var readOnCpu = CPUFallbackCalculator.Calculate(model, backendType, out _);
             long uploaded = 0;
             foreach (var constant in model.constants) {
-                if (constant.shape.length == 0 || readOnCpu.Contains(constant.index)) {
+                if (StaysOnCpu(constant, readOnCpu)) {
                     continue;
                 }
                 var data = ComputeTensorData.Pin(storage.GetTensor(constant.index));
@@ -56,6 +63,10 @@ namespace Doji.AI {
             GC.WaitForPendingFinalizers();
             GC.Collect();
             return worker;
+        }
+
+        private static bool StaysOnCpu(Constant constant, HashSet<int> readOnCpu) {
+            return constant.shape.length == 0 || readOnCpu.Contains(constant.index);
         }
     }
 }
