@@ -11,8 +11,8 @@ namespace Doji.AI {
 
     /// <summary>
     /// An open .sentis file whose weights stay in the file until a worker needs them. On
-    /// <see cref="BackendType.GPUCompute"/>, <see cref="CreateWorker"/> reads each weight into native memory and
-    /// uploads it, so the weights are never in managed memory. The file stays open until the handle is disposed, so on
+    /// <see cref="BackendType.GPUCompute"/> and <see cref="BackendType.CPU"/>, <see cref="CreateWorker"/> reads each
+    /// weight into native memory, and uploads it to the GPU, so the weights are never in managed memory. The file stays open until the handle is disposed, so on
     /// Windows it cannot be deleted or moved meanwhile.
     /// </summary>
     public sealed unsafe class ModelFile : IDisposable {
@@ -123,52 +123,150 @@ namespace Doji.AI {
 
         /// <summary>
         /// Creates a worker. On <see cref="BackendType.GPUCompute"/>, the weights go from the file, or the copy in
-        /// memory, to the GPU. Other backends load the whole model.
+        /// memory, to the GPU. On <see cref="BackendType.CPU"/>, they go into native memory. Other backends load the
+        /// whole model.
         /// </summary>
         public Worker CreateWorker(BackendType backendType) {
             if (_stream == null || !_stream.CanRead) {
                 throw new ObjectDisposedException(nameof(ModelFile));
             }
-            if (backendType != BackendType.GPUCompute) {
+            if (backendType != BackendType.GPUCompute && backendType != BackendType.CPU) {
                 return new Worker(LoadModel(), backendType);
             }
 
             // The worker's storage wraps the CPU data of each constant; this placeholder stands in for the weights
-            // that go to the GPU, which are replaced before they are used.
+            // that are read below, which replace it before they are used.
             var placeholder = new byte[_largest];
-            foreach (var constant in _model.constants) {
-                if (OnGpu(constant)) {
-                    constant.array = new ArraySegment<byte>(placeholder, 0, constant.lengthBytes);
+            var weights = new List<int>();
+            for (int i = 0; i < _model.constants.Count; i++) {
+                if (OnGpu(_model.constants[i])) {
+                    _model.constants[i].array = new ArraySegment<byte>(placeholder, 0, _model.constants[i].lengthBytes);
+                    weights.Add(i);
                 }
             }
-
             var storage = new ModelStorage();
-            var worker = new Worker(_model, BackendFactory.CreateBackend(backendType), storage);
-            using var staging = new NativeArray<int>(_largest / sizeof(int), Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-            long uploaded = 0;
-            for (int i = 0; i < _model.constants.Count; i++) {
-                var constant = _model.constants[i];
-                if (constant.array.Array != placeholder) {
-                    continue;
-                }
-                Tensor tensor = storage.GetTensor(constant.index);
-                var data = new ComputeTensorData(tensor.count);
-                tensor.AdoptTensorData(data, disposePrevious: true, disposeIsDelayed: false);
-                if (_weights != null) {
-                    UnsafeUtility.MemCpy(staging.GetUnsafePtr(), _weights + _weightOffsets[i], constant.lengthBytes);
+            Worker worker = null;
+            try {
+                worker = new Worker(_model, BackendFactory.CreateBackend(backendType), storage);
+                if (backendType == BackendType.GPUCompute) {
+                    Upload(storage, weights);
                 } else {
-                    Read(_offsets[i], staging.GetUnsafePtr(), constant.lengthBytes);
+                    foreach (int i in weights) {
+                        Tensor tensor = storage.GetTensor(_model.constants[i].index);
+                        var data = new CPUTensorData(tensor.count);
+                        tensor.AdoptTensorData(data, disposePrevious: true, disposeIsDelayed: false);
+                        Copy(i, data.array.RawPtr);
+                    }
                 }
-                data.buffer.SetData(staging, 0, 0, Padded(constant.lengthBytes) / sizeof(int));
-                constant.array = default;
-                uploaded += constant.lengthBytes;
-                if (uploaded >= UploadChunkBytes) {
-                    // Reading back one value waits until the GPU has every upload before it.
-                    data.buffer.GetData(new int[1], 0, 0, 1);
-                    uploaded = 0;
+            } catch {
+                worker?.Dispose();
+                throw;
+            } finally {
+                foreach (int i in weights) {
+                    _model.constants[i].array = default;
                 }
             }
             return worker;
+        }
+
+        /// <summary>
+        /// Uploads the weights to the GPU. From the file, it reads the next weight while it uploads one.
+        /// </summary>
+        private void Upload(ModelStorage storage, List<int> weights) {
+            var staging = new NativeArray<int>[2];
+            var commands = new NativeArray<ReadCommand>(2, Allocator.Persistent);
+            ReadHandle pending = default;
+            try {
+                if (_weights == null) {
+                    for (int b = 0; b < staging.Length; b++) {
+                        staging[b] = new NativeArray<int>(_largest / sizeof(int), Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                    }
+                    if (weights.Count > 0) {
+                        pending = StartRead(weights[0], staging[0].GetUnsafePtr(), commands, 0);
+                    }
+                }
+                long uploaded = 0;
+                for (int k = 0; k < weights.Count; k++) {
+                    int i = weights[k];
+                    var constant = _model.constants[i];
+                    int ints = Padded(constant.lengthBytes) / sizeof(int);
+                    NativeArray<int> source;
+                    if (_weights != null) {
+                        source = View(_weights + _weightOffsets[i], ints);
+                    } else {
+                        Finish(ref pending, i);
+                        if (k + 1 < weights.Count) {
+                            int next = (k + 1) % 2;
+                            pending = StartRead(weights[k + 1], staging[next].GetUnsafePtr(), commands, next);
+                        }
+                        source = staging[k % 2];
+                    }
+                    Tensor tensor = storage.GetTensor(constant.index);
+                    var data = new ComputeTensorData(tensor.count);
+                    tensor.AdoptTensorData(data, disposePrevious: true, disposeIsDelayed: false);
+                    data.buffer.SetData(source, 0, 0, ints);
+                    uploaded += constant.lengthBytes;
+                    if (uploaded >= UploadChunkBytes) {
+                        // Reading back one value waits until the GPU has every upload before it.
+                        data.buffer.GetData(new int[1], 0, 0, 1);
+                        uploaded = 0;
+                    }
+                }
+            } finally {
+                if (pending.IsValid()) {
+                    pending.JobHandle.Complete();
+                    pending.Dispose();
+                }
+                commands.Dispose();
+                foreach (var buffer in staging) {
+                    if (buffer.IsCreated) {
+                        buffer.Dispose();
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Copies the constant at position <paramref name="i"/> to <paramref name="destination"/>, from the copy in
+        /// memory or from the file.
+        /// </summary>
+        private void Copy(int i, void* destination) {
+            if (_weights != null) {
+                UnsafeUtility.MemCpy(destination, _weights + _weightOffsets[i], _model.constants[i].lengthBytes);
+                return;
+            }
+            Read(_offsets[i], destination, _model.constants[i].lengthBytes);
+        }
+
+        /// <summary>
+        /// Starts to read the constant at position <paramref name="i"/> from the file, like <see cref="Read"/>. The
+        /// command stays in <paramref name="commands"/> until the read is finished.
+        /// </summary>
+        private ReadHandle StartRead(int i, void* buffer, NativeArray<ReadCommand> commands, int slot) {
+            var command = (ReadCommand*)commands.GetUnsafePtr() + slot;
+            *command = new ReadCommand { Offset = _offsets[i], Size = _model.constants[i].lengthBytes, Buffer = buffer };
+            return AsyncReadManager.Read(Path, command, 1);
+        }
+
+        private void Finish(ref ReadHandle handle, int i) {
+            handle.JobHandle.Complete();
+            ReadStatus status = handle.Status;
+            handle.Dispose();
+            handle = default;
+            if (status != ReadStatus.Complete) {
+                throw new IOException($"Could not read {_model.constants[i].lengthBytes} bytes at {_offsets[i]} of {Path}: {status}");
+            }
+        }
+
+        /// <summary>
+        /// A NativeArray over native memory that this class owns.
+        /// </summary>
+        private static NativeArray<int> View(void* pointer, int length) {
+            var array = NativeArrayUnsafeUtility.ConvertExistingDataToNativeArray<int>(pointer, length, Allocator.None);
+#if ENABLE_UNITY_COLLECTIONS_CHECKS
+            NativeArrayUnsafeUtility.SetAtomicSafetyHandle(ref array, AtomicSafetyHandle.GetTempMemoryHandle());
+#endif
+            return array;
         }
 
         public void Dispose() {
