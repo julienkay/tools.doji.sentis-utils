@@ -4,13 +4,17 @@ using SentisFlatBuffer;
 using Unity.InferenceEngine;
 using Unity.InferenceEngine.Google.FlatBuffers;
 using Unity.Profiling;
+using UnityEngine;
+using static Unity.InferenceEngine.ComputeTensorData;
 using Layers = Unity.InferenceEngine.Layers;
 
 namespace Doji.AI {
 
     /// <summary>
-    /// Attention slicing, like diffusers' <c>enable_attention_slicing</c>: each attention of a model computes its
-    /// scores for a few queries at a time, so it never holds the scores of all queries. The result is the same.
+    /// Attention that needs less memory: each attention of a model becomes one layer that never holds the scores of
+    /// all queries. <see cref="Slice"/> computes them for a few queries at a time, like diffusers'
+    /// <c>enable_attention_slicing</c>. <see cref="UseFlashAttention"/> computes them in one GPU kernel that keeps them
+    /// out of memory, like flash attention. The result is the same, apart from rounding.
     /// </summary>
     public static class Attention {
 
@@ -34,15 +38,41 @@ namespace Doji.AI {
             if (maxScoreBytes <= 0) {
                 throw new ArgumentOutOfRangeException(nameof(maxScoreBytes));
             }
-            int sliced = 0;
+            var attentions = Fuse(model);
+            foreach (var attention in attentions) {
+                attention.maxScoreBytes = maxScoreBytes;
+                attention.flash = false;
+            }
+            return attentions.Count;
+        }
+
+        /// <summary>
+        /// Replaces each attention of <paramref name="model"/> as <see cref="Slice"/> does, with one layer that runs
+        /// a flash attention kernel on <see cref="BackendType.GPUCompute"/>. It needs a head size of at most 128 and
+        /// no broadcasting between the query, key and value; other attentions, and other backends, are sliced with
+        /// <see cref="DefaultSliceBytes"/>.
+        /// </summary>
+        /// <returns>The number of replaced attentions.</returns>
+        public static int UseFlashAttention(Model model) {
+            var attentions = Fuse(model);
+            foreach (var attention in attentions) {
+                attention.flash = true;
+            }
+            return attentions.Count;
+        }
+
+        /// <summary>
+        /// Replaces each attention with an <see cref="AttentionLayer"/>, or returns the ones it replaced before.
+        /// </summary>
+        private static List<AttentionLayer> Fuse(Model model) {
+            var attentions = new List<AttentionLayer>();
             foreach (var layer in model.layers) {
                 if (layer is AttentionLayer attention) {
-                    attention.maxScoreBytes = maxScoreBytes;
-                    sliced++;
+                    attentions.Add(attention);
                 }
             }
-            if (sliced > 0) {
-                return sliced;
+            if (attentions.Count > 0) {
+                return attentions;
             }
 
             var producer = new Dictionary<int, Layer>();
@@ -102,14 +132,14 @@ namespace Doji.AI {
                     continue;
                 }
                 parts.Add(keys);
-                var fused = new AttentionLayer(values.outputs[0], keys.inputs[0], keys.inputs[1], values.inputs[1], mask, scale, bias, maxScoreBytes);
+                var fused = new AttentionLayer(values.outputs[0], keys.inputs[0], keys.inputs[1], values.inputs[1], mask, scale, bias, DefaultSliceBytes);
                 replaced[values] = fused;
+                attentions.Add(fused);
                 foreach (var part in parts) {
                     if (part != values) {
                         removed.Add(part);
                     }
                 }
-                sliced++;
 
                 bool IsScores(Layer l) => l is Layers.MatMul || l is Layers.ScalarMad s && Producer(s.inputs[0]) is Layers.MatMul;
             }
@@ -123,7 +153,7 @@ namespace Doji.AI {
                 }
             }
             model.layers = layers;
-            return sliced;
+            return attentions;
         }
     }
 
@@ -136,6 +166,18 @@ namespace Doji.AI {
         public float scale;
         public float bias;
         public long maxScoreBytes;
+        /// <summary>Whether to run the flash attention kernel where it can.</summary>
+        public bool flash;
+
+        private static readonly ComputeFunction FlashFunction = new ComputeFunction(
+            Resources.Load<ComputeShader>("ComputeShaders/Compute.Shaders.FlashAttention"), "FlashAttention");
+        private const int FlashQueries = 64, FlashThreads = 256, FlashMaxHeadSize = 128;
+        private static readonly int QID = Shader.PropertyToID("Qptr"), KID = Shader.PropertyToID("Kptr"),
+            VID = Shader.PropertyToID("Vptr"), MID = Shader.PropertyToID("Mptr"), OID = Shader.PropertyToID("Optr"),
+            NqID = Shader.PropertyToID("Nq"), NkID = Shader.PropertyToID("Nk"), DID = Shader.PropertyToID("D"),
+            DVID = Shader.PropertyToID("DV"), ScaleID = Shader.PropertyToID("scale"), BiasID = Shader.PropertyToID("bias"),
+            HasMaskID = Shader.PropertyToID("hasMask"), MaskBatchStrideID = Shader.PropertyToID("maskBatchStride"),
+            MaskRowStrideID = Shader.PropertyToID("maskRowStride");
 
         private static readonly ProfilerMarker Marker = new ProfilerMarker("Doji.AI.Attention");
 
@@ -174,6 +216,10 @@ namespace Doji.AI {
                 return;
             }
 
+            if (flash && ctx.backend is GPUComputeBackend gpu && TryFlash(gpu, query, key, value, mask, output)) {
+                return;
+            }
+
             int rows = scoresShape[-2];
             long rowBytes = (long)scoresShape.length / Math.Max(rows, 1) * sizeof(float);
             int chunk = (int)Math.Clamp(maxScoreBytes / Math.Max(rowBytes, 1), 1, rows);
@@ -195,6 +241,66 @@ namespace Doji.AI {
                 }
                 ctx.storage.Dispose(outputRows);
             }
+        }
+
+        /// <summary>
+        /// Dispatches the flash attention kernel, if it supports the shapes: query, key and value with the same
+        /// batch and head dimensions, a head size of at most 128, and a mask that is the same for all of them or
+        /// differs for each.
+        /// </summary>
+        private bool TryFlash(GPUComputeBackend gpu, Tensor<float> query, Tensor<float> key, Tensor<float> value, Tensor<float> mask, Tensor<float> output) {
+            TensorShape q = query.shape, k = key.shape, v = value.shape;
+            int rank = q.rank;
+            if (rank < 3 || k.rank != rank || v.rank != rank) {
+                return false;
+            }
+            int batch = 1;
+            for (int axis = 0; axis < rank - 2; axis++) {
+                if (k[axis] != q[axis] || v[axis] != q[axis]) {
+                    return false;
+                }
+                batch *= q[axis];
+            }
+            int queries = q[-2], size = q[-1], keys = k[-1], valueSize = v[-1];
+            if (size > FlashMaxHeadSize || valueSize > FlashMaxHeadSize || k[-2] != size || v[-2] != keys || batch > 65535) {
+                return false;
+            }
+            int maskBatchStride = 0, maskRowStride = 0;
+            if (mask != null) {
+                TensorShape m = mask.shape;
+                if (m.rank < 1 || m[-1] != keys || m.rank > rank) {
+                    return false;
+                }
+                maskRowStride = m.rank >= 2 && m[-2] == queries ? keys : m.rank >= 2 && m[-2] != 1 ? -1 : 0;
+                int maskBatch = 1;
+                for (int axis = 0; axis < m.rank - 2; axis++) {
+                    maskBatch *= m[axis];
+                }
+                maskBatchStride = maskBatch == batch && m.rank == rank ? (m.rank >= 2 ? m[-2] : 1) * keys : maskBatch == 1 ? 0 : -1;
+                if (maskRowStride < 0 || maskBatchStride < 0) {
+                    return false;
+                }
+            }
+
+            var fn = FlashFunction;
+            var cb = gpu.GetCommandBuffer();
+            cb.SetComputeIntParam(fn.shader, NqID, queries);
+            cb.SetComputeIntParam(fn.shader, NkID, keys);
+            cb.SetComputeIntParam(fn.shader, DID, size);
+            cb.SetComputeIntParam(fn.shader, DVID, valueSize);
+            cb.SetComputeFloatParam(fn.shader, ScaleID, scale);
+            cb.SetComputeFloatParam(fn.shader, BiasID, bias);
+            cb.SetComputeIntParam(fn.shader, HasMaskID, mask != null ? 1 : 0);
+            cb.SetComputeIntParam(fn.shader, MaskBatchStrideID, maskBatchStride);
+            cb.SetComputeIntParam(fn.shader, MaskRowStrideID, maskRowStride);
+            cb.SetTensorAsBuffer(fn, QID, Pin(query));
+            cb.SetTensorAsBuffer(fn, KID, Pin(key));
+            cb.SetTensorAsBuffer(fn, VID, Pin(value));
+            // The kernel reads the mask only when there is one, but every buffer must be set.
+            cb.SetTensorAsBuffer(fn, MID, Pin(mask ?? query));
+            cb.SetTensorAsBuffer(fn, OID, Pin(output));
+            cb.Dispatch(fn, (queries + FlashQueries - 1) / FlashQueries * FlashThreads, batch, 1);
+            return true;
         }
 
         /// <summary>

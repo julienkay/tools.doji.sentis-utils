@@ -1,0 +1,208 @@
+#pragma kernel FlashAttention
+
+// softmax(scale * (Q x K) + bias + M) x V without the scores in memory, as flash attention computes it: each group
+// takes BQ queries of one batch and head, walks the keys in tiles of BK, and keeps a running maximum and sum of each
+// softmax row. Q is (bh, Nq, D), K is transposed (bh, D, Nk), V is (bh, Nk, DV) and O is (bh, Nq, DV).
+//
+// Each thread computes 4 queries x 2 keys of the scores and 4 queries x 8 columns of the output in registers, and
+// reads groupshared memory as float4, so that it does several multiply-adds for each value it reads.
+
+#define BQ 64
+#define BK 32
+#define DC 32
+#define THREADS 256
+#define MAX_D 128
+// The float4 stride of a row of 64 queries, with one more float4 so that rows start in different banks.
+#define Q4_STRIDE (BQ / 4 + 1)
+
+StructuredBuffer<float> Qptr;
+StructuredBuffer<float> Kptr;
+StructuredBuffer<float> Vptr;
+StructuredBuffer<float> Mptr;
+RWStructuredBuffer<float> Optr;
+
+uint Nq, Nk, D, DV;
+float scale, bias;
+uint hasMask, maskBatchStride, maskRowStride;
+
+// A chunk of DC dimensions of the queries, transposed: [c][query / 4], then of the keys: [c][key / 4]. The value
+// tile [key][column / 4] uses the same memory after the scores of a tile are done.
+#define K4_OFFSET (DC * Q4_STRIDE)
+groupshared float4 tile4[BK * MAX_D / 4];
+// The scores and then the probabilities of the tile, transposed: [key][query / 4].
+groupshared float4 P4[BK * Q4_STRIDE];
+groupshared float4 rowMax4[BQ / 4];
+groupshared float4 rowSum4[BQ / 4];
+groupshared float4 rowScale4[BQ / 4];
+
+[numthreads(THREADS, 1, 1)]
+void FlashAttention(uint3 groupID : SV_GroupID, uint t : SV_GroupIndex)
+{
+    const float negativeInfinity = asfloat(0xff800000);
+    uint bh = groupID.y;
+    uint q0 = groupID.x * BQ;
+    uint qBase = bh * Nq * D;
+    uint kBase = bh * D * Nk;
+    uint vBase = bh * Nk * DV;
+    uint oBase = bh * Nq * DV;
+    uint mBase = bh * maskBatchStride;
+
+    // Scores: queries 4 * sq to 4 * sq + 3, keys 2 * sk and 2 * sk + 1.
+    uint sq = t / 16;
+    uint sk = t % 16;
+    // Output: queries 4 * oq to 4 * oq + 3, columns 8 * oc to 8 * oc + 7.
+    uint oq = t / 16;
+    uint oc = t % 16;
+
+    if (t < BQ / 4)
+    {
+        rowMax4[t] = -1e30f;
+        rowSum4[t] = 0;
+    }
+    float4 acc0[4], acc1[4];
+    uint a;
+    [unroll] for (a = 0; a < 4; a++)
+    {
+        acc0[a] = 0;
+        acc1[a] = 0;
+    }
+
+    for (uint k0 = 0; k0 < Nk; k0 += BK)
+    {
+        float4 s0 = 0, s1 = 0;
+        for (uint c0 = 0; c0 < D; c0 += DC)
+        {
+            GroupMemoryBarrierWithGroupSync();
+            // The queries: each thread reads 4 queries of one dimension, 2 times. Consecutive threads read
+            // consecutive dimensions.
+            [unroll] for (uint nq = 0; nq < DC * BQ / 4 / THREADS; nq++)
+            {
+                uint i = t + nq * THREADS;
+                uint c = i % DC, r4 = i / DC;
+                float4 q = 0;
+                if (c0 + c < D)
+                {
+                    [unroll] for (uint e = 0; e < 4; e++)
+                    {
+                        uint r = r4 * 4 + e;
+                        q[e] = q0 + r < Nq ? Qptr[qBase + (q0 + r) * D + c0 + c] : 0;
+                    }
+                }
+                tile4[c * Q4_STRIDE + r4] = q;
+            }
+            // The keys: each thread reads 4 consecutive keys of one dimension.
+            {
+                uint c = t / (BK / 4), j4 = t % (BK / 4);
+                float4 k = 0;
+                if (c0 + c < D)
+                {
+                    [unroll] for (uint e = 0; e < 4; e++)
+                    {
+                        uint j = k0 + j4 * 4 + e;
+                        k[e] = j < Nk ? Kptr[kBase + (c0 + c) * Nk + j] : 0;
+                    }
+                }
+                tile4[K4_OFFSET + c * (BK / 4) + j4] = k;
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            for (uint c = 0; c < DC; c++)
+            {
+                float4 q = tile4[c * Q4_STRIDE + sq];
+                float4 k = tile4[K4_OFFSET + c * (BK / 4) + sk / 2];
+                float2 kk = (sk & 1) ? k.zw : k.xy;
+                s0 += q * kk.x;
+                s1 += q * kk.y;
+            }
+        }
+
+        // Scale, mask and store the scores.
+        [unroll] for (uint n = 0; n < 2; n++)
+        {
+            uint j = sk * 2 + n;
+            float4 s = (n == 0 ? s0 : s1) * scale + bias;
+            [unroll] for (uint e = 0; e < 4; e++)
+            {
+                uint r = sq * 4 + e;
+                if (k0 + j >= Nk)
+                    s[e] = negativeInfinity;
+                else if (hasMask && q0 + r < Nq)
+                    s[e] += Mptr[mBase + (q0 + r) * maskRowStride + k0 + j];
+            }
+            P4[j * Q4_STRIDE + sq] = s;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        // The softmax of the tile, 4 queries per thread.
+        if (t < BQ / 4)
+        {
+            float4 previous = rowMax4[t];
+            float4 m = previous;
+            uint j;
+            for (j = 0; j < BK; j++)
+                m = max(m, P4[j * Q4_STRIDE + t]);
+            float4 sum = 0;
+            for (j = 0; j < BK; j++)
+            {
+                float4 p = exp(P4[j * Q4_STRIDE + t] - m);
+                P4[j * Q4_STRIDE + t] = p;
+                sum += p;
+            }
+            float4 rescale = exp(previous - m);
+            rowSum4[t] = rowSum4[t] * rescale + sum;
+            rowMax4[t] = m;
+            rowScale4[t] = rescale;
+        }
+
+        // The values: consecutive threads read consecutive columns.
+        [unroll] for (uint nv = 0; nv < BK * MAX_D / 4 / THREADS; nv++)
+        {
+            uint i = t + nv * THREADS;
+            uint j = i / (MAX_D / 4), c4 = i % (MAX_D / 4);
+            float4 v = 0;
+            if (k0 + j < Nk)
+            {
+                [unroll] for (uint e = 0; e < 4; e++)
+                {
+                    uint c = c4 * 4 + e;
+                    v[e] = c < DV ? Vptr[vBase + (k0 + j) * DV + c] : 0;
+                }
+            }
+            tile4[j * (MAX_D / 4) + c4] = v;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        float4 rescale = rowScale4[oq];
+        [unroll] for (a = 0; a < 4; a++)
+        {
+            acc0[a] *= rescale[a];
+            acc1[a] *= rescale[a];
+        }
+        for (uint j = 0; j < BK; j++)
+        {
+            float4 p = P4[j * Q4_STRIDE + oq];
+            float4 v0 = tile4[j * (MAX_D / 4) + oc * 2];
+            float4 v1 = tile4[j * (MAX_D / 4) + oc * 2 + 1];
+            [unroll] for (a = 0; a < 4; a++)
+            {
+                acc0[a] += p[a] * v0;
+                acc1[a] += p[a] * v1;
+            }
+        }
+    }
+
+    float4 sum = rowSum4[oq];
+    [unroll] for (a = 0; a < 4; a++)
+    {
+        uint r = q0 + oq * 4 + a;
+        if (r < Nq)
+        {
+            [unroll] for (uint e = 0; e < 8; e++)
+            {
+                uint c = oc * 8 + e;
+                if (c < DV)
+                    Optr[oBase + r * DV + c] = (e < 4 ? acc0[a][e] : acc1[a][e - 4]) / sum[a];
+            }
+        }
+    }
+}

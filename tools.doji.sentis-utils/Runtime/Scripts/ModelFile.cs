@@ -97,6 +97,13 @@ namespace Doji.AI {
         public int SliceAttention(long maxScoreBytes = Attention.DefaultSliceBytes) => Attention.Slice(_model, maxScoreBytes);
 
         /// <summary>
+        /// Runs the attention of the workers created after this with a flash attention kernel, as
+        /// <see cref="Attention.UseFlashAttention"/> does.
+        /// </summary>
+        /// <returns>The number of replaced attentions.</returns>
+        public int UseFlashAttention() => Attention.UseFlashAttention(_model);
+
+        /// <summary>
         /// Whether a copy of the weights stays in native memory, so <see cref="CreateWorker"/> uploads them from
         /// RAM instead of reading the file. Setting it reads or frees the copy.
         /// </summary>
