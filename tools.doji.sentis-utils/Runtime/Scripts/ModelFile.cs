@@ -13,7 +13,8 @@ namespace Doji.AI {
     /// An open .sentis file whose weights stay in the file until a worker needs them. On
     /// <see cref="BackendType.GPUCompute"/> and <see cref="BackendType.CPU"/>, <see cref="CreateWorker"/> reads each
     /// weight into native memory, and uploads it to the GPU, so the weights are never in managed memory. The file stays open until the handle is disposed, so on
-    /// Windows it cannot be deleted or moved meanwhile.
+    /// Windows it cannot be deleted or moved meanwhile. A uint8 embedding table dequantizes only the rows it reads, as
+    /// <see cref="QuantizedGather.Fuse"/> does.
     /// </summary>
     public sealed unsafe partial class ModelFile : IDisposable {
 
@@ -54,6 +55,7 @@ namespace Doji.AI {
             try {
                 byte[] description = ReadSized(_stream);
                 var chunkOffsets = (List<(int constant, int offset)>[])LoadModelDescription.Invoke(null, new object[] { description, _model });
+                QuantizedGather.Fuse(_model);
                 _offsets = new long[_model.constants.Count];
                 foreach (var chunk in chunkOffsets) {
                     long storageStart = FindStorage(_stream);
