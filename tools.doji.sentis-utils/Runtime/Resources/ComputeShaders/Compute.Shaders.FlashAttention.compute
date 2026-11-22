@@ -56,7 +56,8 @@ void FlashAttention(uint3 groupID : SV_GroupID, uint t : SV_GroupIndex)
 
     if (t < BQ / 4)
     {
-        rowMax4[t] = -1e30f;
+        // The lowest float, not -inf: a row whose keys are all masked with it gives equal weights, as softmax does.
+        rowMax4[t] = -3.402823466e+38f;
         rowSum4[t] = 0;
     }
     float4 acc0[4], acc1[4];
@@ -201,7 +202,8 @@ void FlashAttention(uint3 groupID : SV_GroupID, uint t : SV_GroupIndex)
             {
                 uint c = oc * 8 + e;
                 if (c < DV)
-                    Optr[oBase + r * DV + c] = (e < 4 ? acc0[a][e] : acc1[a][e - 4]) / sum[a];
+                    // A row whose keys are all masked with -inf has a sum of 0: give 0, as the NaN guard of torch.export does.
+                    Optr[oBase + r * DV + c] = (e < 4 ? acc0[a][e] : acc1[a][e - 4]) / (sum[a] > 0 ? sum[a] : 1);
             }
         }
     }
