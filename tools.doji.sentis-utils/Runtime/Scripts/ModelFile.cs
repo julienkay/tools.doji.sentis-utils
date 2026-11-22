@@ -15,7 +15,7 @@ namespace Doji.AI {
     /// weight into native memory, and uploads it to the GPU, so the weights are never in managed memory. The file stays open until the handle is disposed, so on
     /// Windows it cannot be deleted or moved meanwhile.
     /// </summary>
-    public sealed unsafe class ModelFile : IDisposable {
+    public sealed unsafe partial class ModelFile : IDisposable {
 
         /// <summary>
         /// The bytes uploaded before waiting for the GPU, as in <see cref="WorkerUtils.CreateWorkerWithWeightsOnGpu"/>.
@@ -134,20 +134,10 @@ namespace Doji.AI {
                 return new Worker(LoadModel(), backendType);
             }
 
-            // The worker's storage wraps the CPU data of each constant; this placeholder stands in for the weights
-            // that are read below, which replace it before they are used.
-            var placeholder = new byte[_largest];
-            var weights = new List<int>();
-            for (int i = 0; i < _model.constants.Count; i++) {
-                if (OnGpu(_model.constants[i])) {
-                    _model.constants[i].array = new ArraySegment<byte>(placeholder, 0, _model.constants[i].lengthBytes);
-                    weights.Add(i);
-                }
-            }
             var storage = new ModelStorage();
-            Worker worker = null;
+            var weights = new List<int>();
+            Worker worker = CreatePlaceholderWorker(backendType, storage, weights);
             try {
-                worker = new Worker(_model, BackendFactory.CreateBackend(backendType), storage);
                 if (backendType == BackendType.GPUCompute) {
                     Upload(storage, weights);
                 } else {
@@ -159,14 +149,32 @@ namespace Doji.AI {
                     }
                 }
             } catch {
-                worker?.Dispose();
+                worker.Dispose();
                 throw;
+            }
+            return worker;
+        }
+
+        /// <summary>
+        /// Creates a worker whose weights that are not read on the CPU are a placeholder, and adds their positions in
+        /// the constants to <paramref name="weights"/>. Replace each placeholder before a layer reads it.
+        /// </summary>
+        private Worker CreatePlaceholderWorker(BackendType backendType, ModelStorage storage, List<int> weights) {
+            // The storage wraps the CPU data of each constant when the worker is created.
+            var placeholder = new byte[_largest];
+            for (int i = 0; i < _model.constants.Count; i++) {
+                if (OnGpu(_model.constants[i])) {
+                    _model.constants[i].array = new ArraySegment<byte>(placeholder, 0, _model.constants[i].lengthBytes);
+                    weights.Add(i);
+                }
+            }
+            try {
+                return new Worker(_model, BackendFactory.CreateBackend(backendType), storage);
             } finally {
                 foreach (int i in weights) {
                     _model.constants[i].array = default;
                 }
             }
-            return worker;
         }
 
         /// <summary>
