@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - `Ops.NonZero`, which returns the indices of the non-zero elements like ONNX NonZero, with shape (rank, count).
 - `Ops.ThrowIfDisposed`, to check a tensor before a worker reads it. A worker that reads a disposed tensor gives wrong values with no exception.
 - `WorkerUtils.CreateWorkerWithWeightsOnGpu`, which uploads a model's weights to the GPU in chunks and frees their CPU copy, so the weights are not in RAM and on the GPU at the same time. This also frees the RAM of a model loaded from a `.sentis` file.
+- `SentisFileLoader`, which loads a `.sentis` file whose weights stay in the file. `SentisFileLoader.CreateWorker` reads each weight from the file into native memory and uploads it, so the weights are never in RAM, and can create the worker again later.
 - `WorkerUtils.DisposeAndMoveWeightsToCpu`, which disposes such a worker and moves the weights back into the model, so the model can create a worker again.
 
 ### Changed
