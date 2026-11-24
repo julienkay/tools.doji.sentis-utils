@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - `Ops.TakeOwnership` and `Ops.WaveOwnership` throw an `ObjectDisposedException` for a disposed tensor.
 - `ModelFile.CreateWorker` and `WorkerUtils.CreateWorkerWithWeightsOnGpu` upload the weights through two small staging buffers and a copy kernel. Before, each upload used `ComputeBuffer.SetData`, whose staging memory the graphics driver frees only some frames later, so loading a model without frames between needed RAM for all of its weights at once.
 - The workers of `ModelFile.CreateWorker` reuse a free GPU buffer for a tensor only if the buffer is at most twice the size of the tensor. When a run starts, they free the buffers that no tensor took during the last run. Above 256 KiB, they round the size of a new buffer up to the next step of a quarter of its power of two (at most 4 MiB), so a tensor that grows, such as a KV cache, can take the buffer of a shorter one. Before, a small output that the worker keeps between runs, such as a KV cache entry, could keep a large buffer, and each run allocated more.
+- `ModelFile.StreamingWorker` submits each weight upload right away. Before, Unity kept the upload memory of each weight until the end of the frame, so a run without frames between its layers needed more RAM.
 
 ## [0.1.1] - 2026-02-17
 

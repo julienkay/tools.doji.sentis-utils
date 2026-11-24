@@ -145,6 +145,9 @@ namespace Doji.AI {
                 var data = new ComputeTensorData(tensor.count);
                 tensor.AdoptTensorData(data, disposePrevious: false, disposeIsDelayed: false);
                 data.buffer.SetData(source, 0, 0, ints);
+                // Unity frees the upload memory of SetData only after it submits the commands that use it, at the
+                // end of the frame or on a flush. Without frames during a run, that memory piles up until the run ends.
+                GL.Flush();
                 _sinceFence += constant.lengthBytes;
                 if (_sinceFence >= _bytesAhead) {
                     Fence(data);
