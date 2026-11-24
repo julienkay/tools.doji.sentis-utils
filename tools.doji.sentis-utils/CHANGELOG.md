@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - `WorkerUtils.DisposeAndMoveWeightsToCpu`, which disposes such a worker and moves the weights back into the model, so the model can create a worker again.
 - `WorkerUtils.TryGiveInput`, which sets an input and gives it to the worker: the next run frees it after the last layer that reads it. `WorkerUtils.TakeOutput` takes an output from the worker without a copy. A KV cache can go through a worker of `ModelFile.CreateWorker` this way and stay in memory only once.
 - `HalfPrecision.Apply` and `ModelFile.UseHalfPrecision` make the named float inputs and outputs of a model float16 (`DataType.Short`). The model casts each such input to float32 right before the first layer that reads it, and each such output to float16 right after the layer that writes it. A KV cache can then stay in float16 between runs, at half the memory. The float16 outputs need the GPU backend and a worker of `ModelFile.CreateWorker`. `ModelFile.HasHalfPrecisionWeights` tells whether a model has float16 weights.
+- `WorkerScheduling.ScheduleInParts` (`commandBuffer.ScheduleInParts(worker, ...)`), which schedules one run of a worker in parts: each `MoveNext` schedules layers until a time budget is used, or until a callback ends the part, and then executes the command buffer once. Call it once per frame to spread a long run over frames. The outputs are the same as `Worker.Schedule()`. The worker keeps recording into the command buffer afterwards, so execute it after each later `Schedule()`.
 
 ### Changed
 
