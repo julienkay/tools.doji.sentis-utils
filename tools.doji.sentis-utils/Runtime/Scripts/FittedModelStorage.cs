@@ -12,6 +12,9 @@ namespace Doji.AI {
     /// cache of a language model. Small outputs can then keep large buffers, for example the buffer of a weight that
     /// was dequantized to float32, and each run allocates more large buffers. Also, when a run starts, this storage
     /// frees the buffers that no tensor took during the last run, for example buffers for a KV cache that was shorter.
+    /// An input given with <see cref="GiveInput"/> is freed after the last layer that reads it, and an output taken
+    /// with <see cref="TakeTensorOwnership"/> leaves the storage, so a KV cache can go through the worker without a
+    /// copy.
     /// </summary>
     internal sealed class FittedModelStorage : IModelStorage {
 
@@ -24,12 +27,19 @@ namespace Doji.AI {
         private HashSet<int> _notOwned = new HashSet<int>();
         private readonly Dictionary<int, List<int>> _disposeWhenLayerDone = new Dictionary<int, List<int>>();
         private HashSet<int> _unconnected = new HashSet<int>();
+        /// <summary>The inputs to free after each layer, if they were given with <see cref="GiveInput"/>.</summary>
+        private readonly Dictionary<int, List<int>> _inputsToFreeWhenLayerDone = new Dictionary<int, List<int>>();
+        /// <summary>The given inputs that are not freed yet, with the run they were given for.</summary>
+        private readonly Dictionary<int, int> _given = new Dictionary<int, int>();
+        private int _run;
 
         /// <summary>Free GPU buffers by capacity.</summary>
         private readonly SortedDictionary<int, Stack<ComputeTensorData>> _gpuPool = new SortedDictionary<int, Stack<ComputeTensorData>>();
         private readonly SortedSet<int> _gpuCapacities = new SortedSet<int>();
         /// <summary>Free GPU buffers that no tensor took since the last run started.</summary>
         private readonly HashSet<ComputeTensorData> _idle = new HashSet<ComputeTensorData>();
+        /// <summary>Free GPU buffers of given inputs, which the next run start frees if no tensor took them.</summary>
+        private readonly HashSet<ComputeTensorData> _fromInputs = new HashSet<ComputeTensorData>();
         private readonly Dictionary<int, Stack<CPUTensorData>> _cpuPool = new Dictionary<int, Stack<CPUTensorData>>();
 
         public Tensor GetTensor(int index) => index == -1 ? null : _inUse[index];
@@ -92,7 +102,7 @@ namespace Doji.AI {
             };
             int count = shape.length;
             tensor.dataOnBackend = backendType switch {
-                BackendType.GPUCompute => AdoptGpu(count) ?? new ComputeTensorData(count),
+                BackendType.GPUCompute => AdoptGpu(count) ?? NewGpu(count),
                 BackendType.CPU => AdoptCpu(count) ?? new CPUTensorData(count),
                 _ => null,
             };
@@ -114,10 +124,34 @@ namespace Doji.AI {
             }
         }
 
-        public void SetInput(int index, Tensor X) => _inUse[index] = X;
+        public void SetInput(int index, Tensor X) {
+            FreeGiven(index);
+            _inUse[index] = X;
+        }
+
+        /// <summary>
+        /// Sets an input that the storage owns: the next run frees it after the last layer that reads it.
+        /// </summary>
+        public void GiveInput(int index, Tensor X) {
+            FreeGiven(index);
+            _inUse[index] = X;
+            _given[index] = _run + 1;
+        }
+
+        private void FreeGiven(int index) {
+            if (_given.Remove(index) && _inUse.TryGetValue(index, out var tensor)) {
+                if (tensor?.dataOnBackend is ComputeTensorData data) {
+                    _fromInputs.Add(data);
+                }
+                Dispose(tensor);
+                _inUse[index] = null;
+            }
+        }
 
         public void PrepareStorage(Model model) {
             _disposeWhenLayerDone.Clear();
+            _inputsToFreeWhenLayerDone.Clear();
+            _given.Clear();
             _inUse.Clear();
             _notOwned = new HashSet<int>(model.inputs.Select(i => i.index));
 
@@ -159,11 +193,22 @@ namespace Doji.AI {
             }
             foreach (var input in model.inputs) {
                 _unconnected.Remove(input.index);
+                if (lastReader.TryGetValue(input.index, out int layer)) {
+                    if (!_inputsToFreeWhenLayerDone.TryGetValue(layer, out var list)) {
+                        _inputsToFreeWhenLayerDone[layer] = list = new List<int>();
+                    }
+                    list.Add(input.index);
+                }
             }
         }
 
         public void DisposeOnExecute() {
             FreeIdleBuffers();
+            _run++;
+            // Given inputs that the last run did not read.
+            foreach (var index in _given.Where(g => g.Value < _run).Select(g => g.Key).ToArray()) {
+                FreeGiven(index);
+            }
             foreach (var index in _unconnected) {
                 if (_inUse.TryGetValue(index, out var tensor)) {
                     Dispose(tensor);
@@ -173,6 +218,11 @@ namespace Doji.AI {
         }
 
         public void DisposeAfterLayer(Layer layer) {
+            if (_inputsToFreeWhenLayerDone.TryGetValue(layer.outputs[0], out var inputs)) {
+                foreach (var index in inputs) {
+                    FreeGiven(index);
+                }
+            }
             if (!_disposeWhenLayerDone.TryGetValue(layer.outputs[0], out var list)) {
                 return;
             }
@@ -214,6 +264,7 @@ namespace Doji.AI {
             if (!_inUse.Remove(index, out var tensor)) {
                 D.LogWarning("ModelStorage missing variable: " + index);
             }
+            _given.Remove(index);
             return tensor;
         }
 
@@ -226,6 +277,7 @@ namespace Doji.AI {
             _gpuPool.Clear();
             _gpuCapacities.Clear();
             _idle.Clear();
+            _fromInputs.Clear();
             foreach (var stack in _cpuPool.Values) {
                 foreach (var data in stack) {
                     data.Dispose();
@@ -233,8 +285,11 @@ namespace Doji.AI {
             }
             _cpuPool.Clear();
             foreach (var input in _notOwned) {
-                _inUse.Remove(input);
+                if (!_given.ContainsKey(input)) {
+                    _inUse.Remove(input);
+                }
             }
+            _given.Clear();
             foreach (var tensor in _inUse.Values) {
                 tensor?.Dispose();
             }
@@ -265,6 +320,7 @@ namespace Doji.AI {
                 _gpuCapacities.Remove(capacity);
             }
             _idle.Remove(data);
+            _fromInputs.Remove(data);
             return data;
         }
 
@@ -272,6 +328,8 @@ namespace Doji.AI {
         /// Frees the GPU buffers that no tensor took since the last call, and marks the others as idle.
         /// </summary>
         private void FreeIdleBuffers() {
+            _idle.UnionWith(_fromInputs);
+            _fromInputs.Clear();
             if (_idle.Count > 0) {
                 foreach (int capacity in _gpuCapacities.ToArray()) {
                     var stack = _gpuPool[capacity];
@@ -296,6 +354,29 @@ namespace Doji.AI {
             foreach (var stack in _gpuPool.Values) {
                 _idle.UnionWith(stack);
             }
+        }
+
+        /// <summary>
+        /// Allocates a GPU buffer of at least <paramref name="count"/> elements. Above 256 KiB, the size is rounded
+        /// up to the step after it, in steps of a quarter of its power of two and at most 4 MiB, like a caching
+        /// allocator's size classes. A growing tensor, such as a KV cache, can then take the buffer of the step before.
+        /// </summary>
+        private ComputeTensorData NewGpu(int count) {
+            long bytes = 4L * count;
+            if (bytes > 256 << 10) {
+                long step = Math.Min(4L << 20, (1L << (63 - LeadingZeros(bytes))) / 4);
+                bytes = (bytes / step + 1) * step;
+            }
+            int capacity = (int)Math.Min(bytes / 4, int.MaxValue);
+            return new ComputeTensorData(capacity);
+        }
+
+        private static int LeadingZeros(long x) {
+            int n = 0;
+            for (long bit = 1L << 62; bit > 0 && (x & bit) == 0; bit >>= 1) {
+                n++;
+            }
+            return n + 1;
         }
 
         private void ReleaseGpu(ComputeTensorData data) {

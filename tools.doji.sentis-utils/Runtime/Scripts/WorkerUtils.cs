@@ -95,6 +95,39 @@ namespace Doji.AI {
             worker.Dispose();
         }
 
+        private static readonly System.Reflection.FieldInfo WorkerModel = typeof(Worker).GetField("m_Model",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        private static readonly System.Reflection.FieldInfo WorkerStorage = typeof(Worker).GetField("m_Storage",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+        /// <summary>
+        /// Sets input <paramref name="index"/> and, if the worker supports it, gives the tensor to the worker: the
+        /// next <see cref="Worker.Schedule()"/> frees it after the last layer that reads it, so it does not stay in
+        /// memory while the rest of the model runs. Workers of <see cref="ModelFile.CreateWorker"/> support it.
+        /// </summary>
+        /// <returns>
+        /// True if the worker owns the tensor now: do not use or dispose it. False if the input is set and the
+        /// caller still owns the tensor.
+        /// </returns>
+        public static bool TryGiveInput(this Worker worker, int index, Tensor input) {
+            worker.SetInput(index, input);
+            if (WorkerStorage.GetValue(worker) is not FittedModelStorage storage) {
+                return false;
+            }
+            storage.GiveInput(index, input);
+            return true;
+        }
+
+        /// <summary>
+        /// Takes output <paramref name="index"/> from the worker without a copy. The caller owns and disposes the
+        /// tensor, and the next run of the worker writes a new one.
+        /// </summary>
+        public static Tensor TakeOutput(this Worker worker, int index) {
+            var model = (Model)WorkerModel.GetValue(worker);
+            var storage = (IModelStorage)WorkerStorage.GetValue(worker);
+            return storage.TakeTensorOwnership(model.outputs[index].index);
+        }
+
         private static bool StaysOnCpu(Constant constant, HashSet<int> readOnCpu) {
             return constant.shape.length == 0 || readOnCpu.Contains(constant.index);
         }
