@@ -1,0 +1,19 @@
+#pragma kernel CastFloatToHalf
+
+// Packs Length floats of X into float16 pairs: O[i] holds X[2i] in its low 16 bits and X[2i + 1] in its high bits,
+// as Inference Engine stores DataType.Short tensors and reads them in CastHalfToFloat.
+
+StructuredBuffer<float> Xptr;
+RWStructuredBuffer<uint> Optr;
+uint Length, Count, GroupsX;
+
+[numthreads(256, 1, 1)]
+void CastFloatToHalf(uint3 groupId : SV_GroupID, uint threadIndex : SV_GroupIndex)
+{
+    uint i = (groupId.y * GroupsX + groupId.x) * 256 + threadIndex;
+    if (i >= Count)
+        return;
+    uint lo = f32tof16(Xptr[2 * i]);
+    uint hi = 2 * i + 1 < Length ? f32tof16(Xptr[2 * i + 1]) : 0;
+    Optr[i] = lo | (hi << 16);
+}

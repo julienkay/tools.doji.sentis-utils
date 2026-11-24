@@ -98,9 +98,12 @@ namespace Doji.AI {
             Tensor tensor = dataType switch {
                 DataType.Float => new Tensor<float>(shape, data: null),
                 DataType.Int => new Tensor<int>(shape, data: null),
+                DataType.Short => new Tensor<short>(shape, data: null),
+                DataType.Byte => new Tensor<byte>(shape, data: null),
                 _ => throw new NotImplementedException(),
             };
-            int count = shape.length;
+            // Short and Byte tensors pack several values in each 32-bit element.
+            int count = tensor.count;
             tensor.dataOnBackend = backendType switch {
                 BackendType.GPUCompute => AdoptGpu(count) ?? NewGpu(count),
                 BackendType.CPU => AdoptCpu(count) ?? new CPUTensorData(count),

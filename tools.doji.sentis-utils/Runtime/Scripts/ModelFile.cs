@@ -101,6 +101,18 @@ namespace Doji.AI {
         public int UseFlashAttention() => Attention.UseFlashAttention(_model);
 
         /// <summary>
+        /// Makes the named inputs and outputs of the workers created after this float16, as
+        /// <see cref="HalfPrecision.Apply"/> does.
+        /// </summary>
+        /// <returns>The number of inputs and outputs it changed.</returns>
+        public int UseHalfPrecision(ICollection<string> inputs, ICollection<string> outputs) => HalfPrecision.Apply(_model, inputs, outputs);
+
+        /// <summary>
+        /// Whether the model has float16 weights.
+        /// </summary>
+        public bool HasHalfPrecisionWeights => _model.constants.Exists(c => c.dataType == DataType.Short);
+
+        /// <summary>
         /// Whether a copy of the weights stays in native memory, so <see cref="CreateWorker"/> uploads them from
         /// RAM instead of reading the file. Setting it reads or frees the copy.
         /// </summary>
