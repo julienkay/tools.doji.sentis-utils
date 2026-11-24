@@ -19,11 +19,6 @@ namespace Doji.AI {
     public sealed unsafe partial class ModelFile : IDisposable {
 
         /// <summary>
-        /// The bytes uploaded before waiting for the GPU, as in <see cref="WorkerUtils.CreateWorkerWithWeightsOnGpu"/>.
-        /// </summary>
-        private const long UploadChunkBytes = 256L << 20;
-
-        /// <summary>
         /// ModelLoader's private LoadModelDescription(byte[], Model), which returns the offset of each constant in
         /// its weights chunk.
         /// </summary>
@@ -198,6 +193,7 @@ namespace Doji.AI {
         private void Upload(IModelStorage storage, List<int> weights) {
             var staging = new NativeArray<int>[2];
             var commands = new NativeArray<ReadCommand>(2, Allocator.Persistent);
+            using var upload = new GpuUpload();
             ReadHandle pending = default;
             try {
                 if (_weights == null) {
@@ -208,7 +204,6 @@ namespace Doji.AI {
                         pending = StartRead(weights[0], staging[0].GetUnsafePtr(), commands, 0);
                     }
                 }
-                long uploaded = 0;
                 for (int k = 0; k < weights.Count; k++) {
                     int i = weights[k];
                     var constant = _model.constants[i];
@@ -227,13 +222,7 @@ namespace Doji.AI {
                     Tensor tensor = storage.GetTensor(constant.index);
                     var data = new ComputeTensorData(tensor.count);
                     tensor.AdoptTensorData(data, disposePrevious: true, disposeIsDelayed: false);
-                    data.buffer.SetData(source, 0, 0, ints);
-                    uploaded += constant.lengthBytes;
-                    if (uploaded >= UploadChunkBytes) {
-                        // Reading back one value waits until the GPU has every upload before it.
-                        data.buffer.GetData(new int[1], 0, 0, 1);
-                        uploaded = 0;
-                    }
+                    upload.Upload(source.GetUnsafeReadOnlyPtr(), data.buffer, ints);
                 }
             } finally {
                 if (pending.IsValid()) {

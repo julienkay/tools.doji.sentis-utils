@@ -1,0 +1,15 @@
+#pragma kernel CopyInts
+
+// Copies Count 32-bit values from Src to Dst, starting at DstOffset in Dst. GpuUpload uses it to move weights from a
+// small staging buffer that the CPU writes to the buffers of the weights.
+
+StructuredBuffer<uint> Src;
+RWStructuredBuffer<uint> Dst;
+uint Count, DstOffset;
+
+[numthreads(256, 1, 1)]
+void CopyInts(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < Count)
+        Dst[DstOffset + id.x] = Src[id.x];
+}

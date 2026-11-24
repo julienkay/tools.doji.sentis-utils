@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using Unity.InferenceEngine;
+using UnityEngine;
 
 namespace Doji.AI {
     public static class WorkerUtils {
@@ -17,12 +18,6 @@ namespace Doji.AI {
             }
             return worker.ScheduleIterable();
         }
-
-        /// <summary>
-        /// The bytes uploaded before waiting for the GPU. The driver keeps a copy of each upload until the GPU has
-        /// it, so without waiting a large model would need its weights in RAM twice.
-        /// </summary>
-        private const long UploadChunkBytes = 256L << 20;
 
         /// <summary>
         /// The model and storage of each worker that <see cref="CreateWorkerWithWeightsOnGpu"/> made.
@@ -50,18 +45,16 @@ namespace Doji.AI {
 
             var storage = new ModelStorage();
             var worker = new Worker(model, BackendFactory.CreateBackend(backendType), storage);
-            long uploaded = 0;
-            foreach (var constant in model.constants) {
-                if (StaysOnCpu(constant, readOnCpu)) {
-                    continue;
-                }
-                var data = ComputeTensorData.Pin(storage.GetTensor(constant.index));
-                constant.array = default;
-                uploaded += constant.lengthBytes;
-                if (uploaded >= UploadChunkBytes) {
-                    // Reading back one value waits until the GPU has every upload before it.
-                    data.buffer.GetData(new int[1], 0, 0, 1);
-                    uploaded = 0;
+            using (var upload = new GpuUpload()) {
+                foreach (var constant in model.constants) {
+                    if (StaysOnCpu(constant, readOnCpu)) {
+                        continue;
+                    }
+                    Tensor tensor = storage.GetTensor(constant.index);
+                    var data = new ComputeTensorData(tensor.count);
+                    Upload(upload, constant.array, data.buffer);
+                    tensor.AdoptTensorData(data, disposePrevious: true, disposeIsDelayed: false);
+                    constant.array = default;
                 }
             }
             // The weights stay pinned until a finalizer releases them (NativeTensorArrayFromManagedArray.Dispose
@@ -126,6 +119,20 @@ namespace Doji.AI {
             var model = (Model)WorkerModel.GetValue(worker);
             var storage = (IModelStorage)WorkerStorage.GetValue(worker);
             return storage.TakeTensorOwnership(model.outputs[index].index);
+        }
+
+        /// <summary>
+        /// Uploads <paramref name="bytes"/> to the start of <paramref name="destination"/>, in 32-bit values.
+        /// </summary>
+        private static unsafe void Upload(GpuUpload upload, ArraySegment<byte> bytes, ComputeBuffer destination) {
+            if (bytes.Count % sizeof(int) != 0) {
+                var padded = new byte[(bytes.Count + sizeof(int) - 1) / sizeof(int) * sizeof(int)];
+                Buffer.BlockCopy(bytes.Array, bytes.Offset, padded, 0, bytes.Count);
+                bytes = new ArraySegment<byte>(padded);
+            }
+            fixed (byte* source = &bytes.Array[bytes.Offset]) {
+                upload.Upload(source, destination, bytes.Count / sizeof(int));
+            }
         }
 
         private static bool StaysOnCpu(Constant constant, HashSet<int> readOnCpu) {
