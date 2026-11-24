@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ### Changed
 
 - `Ops.TakeOwnership` and `Ops.WaveOwnership` throw an `ObjectDisposedException` for a disposed tensor.
+- The workers of `ModelFile.CreateWorker` reuse a free GPU buffer for a tensor only if the buffer is at most twice the size of the tensor. When a run starts, they free the buffers that no tensor took during the last run. Before, a small output that the worker keeps between runs, such as a KV cache entry, could keep a large buffer, and each run allocated more. With Phi-3-mini (uint8), the GPU memory after 32 generated tokens drops from 13.1 GB to 8.6 GB.
 
 ## [0.1.1] - 2026-02-17
 

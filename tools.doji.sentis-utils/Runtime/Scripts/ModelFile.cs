@@ -149,7 +149,7 @@ namespace Doji.AI {
                 return new Worker(LoadModel(), backendType);
             }
 
-            var storage = new ModelStorage();
+            var storage = new FittedModelStorage();
             var weights = new List<int>();
             Worker worker = CreatePlaceholderWorker(backendType, storage, weights);
             try {
@@ -174,7 +174,7 @@ namespace Doji.AI {
         /// Creates a worker whose weights that are not read on the CPU are a placeholder, and adds their positions in
         /// the constants to <paramref name="weights"/>. Replace each placeholder before a layer reads it.
         /// </summary>
-        private Worker CreatePlaceholderWorker(BackendType backendType, ModelStorage storage, List<int> weights) {
+        private Worker CreatePlaceholderWorker(BackendType backendType, IModelStorage storage, List<int> weights) {
             // The storage wraps the CPU data of each constant when the worker is created.
             var placeholder = new byte[_largest];
             for (int i = 0; i < _model.constants.Count; i++) {
@@ -195,7 +195,7 @@ namespace Doji.AI {
         /// <summary>
         /// Uploads the weights to the GPU. From the file, it reads the next weight while it uploads one.
         /// </summary>
-        private void Upload(ModelStorage storage, List<int> weights) {
+        private void Upload(IModelStorage storage, List<int> weights) {
             var staging = new NativeArray<int>[2];
             var commands = new NativeArray<ReadCommand>(2, Allocator.Persistent);
             ReadHandle pending = default;
