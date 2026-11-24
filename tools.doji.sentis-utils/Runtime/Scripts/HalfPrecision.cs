@@ -97,7 +97,7 @@ namespace Doji.AI {
             return changed;
         }
 
-        private static int NextIndex(Model model) {
+        internal static int NextIndex(Model model) {
             int max = -1;
             foreach (var input in model.inputs) {
                 max = Math.Max(max, input.index);

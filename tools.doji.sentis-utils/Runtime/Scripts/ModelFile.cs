@@ -51,6 +51,7 @@ namespace Doji.AI {
                 byte[] description = ReadSized(_stream);
                 var chunkOffsets = (List<(int constant, int offset)>[])LoadModelDescription.Invoke(null, new object[] { description, _model });
                 QuantizedGather.Fuse(_model);
+                Readbacks.Avoid(_model);
                 _offsets = new long[_model.constants.Count];
                 foreach (var chunk in chunkOffsets) {
                     long storageStart = FindStorage(_stream);

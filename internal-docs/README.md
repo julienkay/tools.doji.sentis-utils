@@ -12,6 +12,7 @@ Short pages, one per idea. Each one says what the feature does, which well-known
 | [QuantizedGather](quantized-gather.md) | A uint8 embedding table dequantizes only the rows it reads. | llama.cpp `get_rows` on quantized tensors |
 | [HalfPrecision](half-precision.md) | Chosen inputs and outputs stay float16 between runs. | float16 KV cache in transformers, vLLM, llama.cpp |
 | [ScheduleInParts](schedule-in-parts.md) | One run of a worker spread over frames, with one command buffer execute per part. | Time-sliced jobs with a frame budget |
+| [Readbacks](readbacks.md) | Small CPU values that a GPU layer reads get a CPU copy, so the CPU never downloads them. | Sizes kept on the host in PyTorch |
 
 For the KV cache and chunked prefill of language models, see `internal-docs/` in tools.doji.transformers.
 
