@@ -1,0 +1,100 @@
+#pragma kernel GatedDeltaRule
+
+// The gated delta rule of Gated DeltaNet, one token after the other. For each token t of a batch b and head h:
+//
+//   S = S * exp(g[t])
+//   delta = (v[t] - S^T k[t]) * beta[t]
+//   S = S + k[t] delta^T
+//   o[t] = S^T (q[t] * scale)
+//
+// S is the state, Dk x Dv. Q and K are (B, T, H, Dk), V and O are (B, T, H, Dv), G and Beta are (B, T, H), and the
+// states are (B, H, Dk, Dv). The columns of S do not depend on each other: each thread keeps one column in
+// registers, and the threads of a group share the key and the query of each token in groupshared memory.
+
+#define THREADS 32
+#define MAX_DK 128
+
+StructuredBuffer<float> Qptr;
+StructuredBuffer<float> Kptr;
+StructuredBuffer<float> Vptr;
+StructuredBuffer<float> Gptr;
+StructuredBuffer<float> Bptr;
+StructuredBuffer<float> Sptr;
+RWStructuredBuffer<float> Optr;
+RWStructuredBuffer<float> SOptr;
+
+uint T, H, Dk, Dv;
+float scale;
+
+groupshared float sharedK[MAX_DK];
+groupshared float sharedQ[MAX_DK];
+
+[numthreads(THREADS, 1, 1)]
+void GatedDeltaRule(uint3 groupID : SV_GroupID, uint t : SV_GroupIndex)
+{
+    uint column = groupID.x * THREADS + t;
+    uint bh = groupID.y;
+    uint b = bh / H;
+    uint h = bh % H;
+    bool active = column < Dv;
+
+    float s[MAX_DK];
+    uint stateBase = bh * Dk * Dv + column;
+    [unroll]
+    for (uint k = 0; k < MAX_DK; k++)
+    {
+        s[k] = 0;
+        // HLSL evaluates both sides of ?:, so the reads that can be out of range use an if.
+        if (active && k < Dk)
+            s[k] = Sptr[stateBase + k * Dv];
+    }
+
+    for (uint i = 0; i < T; i++)
+    {
+        uint row = (b * T + i) * H + h;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint c = t; c < Dk; c += THREADS)
+        {
+            sharedK[c] = Kptr[row * Dk + c];
+            sharedQ[c] = Qptr[row * Dk + c] * scale;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        float decay = exp(Gptr[row]);
+        float beta = Bptr[row];
+        float memory = 0;
+        [unroll]
+        for (uint k1 = 0; k1 < MAX_DK; k1++)
+        {
+            if (k1 < Dk)
+            {
+                s[k1] *= decay;
+                memory += s[k1] * sharedK[k1];
+            }
+        }
+        float v = 0;
+        if (active)
+            v = Vptr[row * Dv + column];
+        float delta = (v - memory) * beta;
+        float o = 0;
+        [unroll]
+        for (uint k2 = 0; k2 < MAX_DK; k2++)
+        {
+            if (k2 < Dk)
+            {
+                s[k2] += sharedK[k2] * delta;
+                o += s[k2] * sharedQ[k2];
+            }
+        }
+        if (active)
+            Optr[row * Dv + column] = o;
+    }
+
+    if (active)
+    {
+        [unroll]
+        for (uint k3 = 0; k3 < MAX_DK; k3++)
+            if (k3 < Dk)
+                SOptr[stateBase + k3 * Dv] = s[k3];
+    }
+}
